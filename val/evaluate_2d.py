@@ -167,6 +167,22 @@ def main():
     # Decide classes to evaluate
     classes = args.classes if args.classes is not None else pred_classes
 
+    # Print GT and prediction stats by class
+    print('\n--- Data Stats ---')
+    counts_pred = {cls: 0 for cls in classes}
+    for plist in pred_per_image.values():
+        for p in plist:
+            if p['cls'] in classes:
+                counts_pred[p['cls']] += 1
+    counts_gt = {cls: 0 for cls in classes}
+    for gts in gt_by_image.values():
+        for g in gts:
+            if g['cls'] in classes:
+                counts_gt[g['cls']] += 1
+    for cls in classes:
+        print(f"Class '{cls}': Preds={counts_pred[cls]}, GT={counts_gt[cls]}")
+    print('---')
+
     ap_per_class, mAP, prec_per_class, rec_per_class, npos = evaluate_2d(
         pred_per_image=pred_per_image,
         gt_by_image=gt_by_image,
@@ -182,7 +198,8 @@ def main():
         total = npos.get(cls, 0)
         last_p = float(prec_per_class[cls][-1]) if len(prec_per_class[cls]) else 0.0
         last_r = float(rec_per_class[cls][-1]) if len(rec_per_class[cls]) else 0.0
-        print(f'- {cls}: AP={ap:.4f}, recall={last_r:.4f}, precision={last_p:.4f}, GT={total}')
+        f1 = 2*last_p*last_r/(last_p+last_r) if (last_p+last_r)>0 else 0.0
+        print(f'- {cls}: AP={ap:.4f}, recall={last_r:.4f}, precision={last_p:.4f}, F1={f1:.4f}, GT={total}')
     print(f'mAP: {mAP:.4f}')
 
 

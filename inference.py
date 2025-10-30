@@ -87,6 +87,9 @@ def detect3d(
     all_predictions = []
 
     # loop images
+    predicted_labels_dir = os.path.join(output_path, 'predicted_labels') if output_path else 'predicted_labels'
+    if save_result:
+        os.makedirs(predicted_labels_dir, exist_ok=True)
     for i, img_path in enumerate(imgs_path):
         # read image
         img = cv2.imread(img_path)
@@ -158,12 +161,46 @@ def detect3d(
             cv2.imshow('3d detection', img)
             cv2.waitKey(0)
 
+        # Save processed prediction image
         if save_result and output_path is not None:
             try:
-                os.mkdir(output_path)
+                os.makedirs(output_path, exist_ok=True)
             except:
                 pass
-            cv2.imwrite(f'{output_path}/{i:03d}.png', img)
+            out_img_name = os.path.splitext(os.path.basename(img_path))[0] + '.png'
+            cv2.imwrite(os.path.join(output_path, out_img_name), img)
+
+        # Save KITTI label per image
+        if save_result and output_path is not None and len(dets) > 0:
+            kitti_label_path = os.path.join(predicted_labels_dir, os.path.splitext(os.path.basename(img_path))[0] + '.txt')
+            kitti_lines = []
+            for det in dets:
+                # get corresponding prediction info
+                # fallbacks if no 3d info (should be present)
+                try:
+                    label_class = det.detected_class
+                    # fallback dummy values, will get overwritten if using 3D pipeline results
+                    alpha_f = float(alpha)
+                    bbox = det.box_2d
+                    x1, y1 = bbox[0]
+                    x2, y2 = bbox[1]
+                    score = float(det.score) if hasattr(det, 'score') and det.score is not None else -1
+                    dim_vals = [float(dim[0]), float(dim[1]), float(dim[2])]
+                    location_vals = [float(location[0]), float(location[1]), float(location[2])]
+                    rot_y = float(orient_yaw)
+
+                    # KITTI label: type, truncated, occluded, alpha, bbox, dims(hwl), loc(xyz), rotation_y, score
+                    kitti_line = f"{label_class} 0 0 {alpha_f:.2f} {int(x1)} {int(y1)} {int(x2)} {int(y2)} " \
+                                f"{dim_vals[0]:.2f} {dim_vals[1]:.2f} {dim_vals[2]:.2f} " \
+                                f"{location_vals[0]:.2f} {location_vals[1]:.2f} {location_vals[2]:.2f} " \
+                                f"{rot_y:.2f} {score:.4f}\n"
+                    kitti_lines.append(kitti_line)
+                except Exception as e:
+                    # skip bad store
+                    continue
+            if kitti_lines:
+                with open(kitti_label_path, 'w') as f:
+                    f.writelines(kitti_lines)
 
     # write json once per run
     if save_json:
