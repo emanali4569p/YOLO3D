@@ -4,6 +4,7 @@ Run inference on images, videos, directories, streams, etc.
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -48,9 +49,11 @@ regressor_factory = {
 }
 
 class Bbox:
-    def __init__(self, box_2d, class_):
+    def __init__(self, box_2d, class_, score=None, cls_id=None):
         self.box_2d = box_2d
         self.detected_class = class_
+        self.score = score
+        self.cls_id = cls_id
 
 def detect3d(
     reg_weights,
@@ -59,7 +62,9 @@ def detect3d(
     calib_file,
     show_result,
     save_result,
-    output_path
+    output_path,
+    save_json=False,
+    json_path=None
     ):
 
     # Directory
@@ -77,6 +82,9 @@ def detect3d(
 
     averages = ClassAverages.ClassAverages()
     angle_bins = generate_bins(2)
+
+    # storage for predictions
+    all_predictions = []
 
     # loop images
     for i, img_path in enumerate(imgs_path):
@@ -126,8 +134,25 @@ def detect3d(
             alpha += angle_bins[argmax]
             alpha -= np.pi
 
-            # plot 3d detection
-            plot3d(img, proj_matrix, box_2d, dim, alpha, theta_ray)
+            # plot 3d detection and get location
+            orient_yaw = alpha + theta_ray
+            location = plot3d(img, proj_matrix, box_2d, dim, alpha, theta_ray)
+
+            # store prediction record
+            if save_json:
+                x1, y1 = box_2d[0]
+                x2, y2 = box_2d[1]
+                all_predictions.append({
+                    'image': os.path.basename(img_path),
+                    'bbox': [int(x1), int(y1), int(x2), int(y2)],
+                    'score': float(det.score) if hasattr(det, 'score') and det.score is not None else None,
+                    'class_name': det.detected_class,
+                    'class_id': int(det.cls_id) if hasattr(det, 'cls_id') and det.cls_id is not None else None,
+                    'alpha': float(alpha),
+                    'rotation_y': float(orient_yaw),
+                    'dimensions': [float(dim[0]), float(dim[1]), float(dim[2])],
+                    'location': [float(location[0]), float(location[1]), float(location[2])]
+                })
 
         if show_result:
             cv2.imshow('3d detection', img)
@@ -139,6 +164,16 @@ def detect3d(
             except:
                 pass
             cv2.imwrite(f'{output_path}/{i:03d}.png', img)
+
+    # write json once per run
+    if save_json:
+        out_json = json_path if json_path is not None else str(ROOT / 'predictions.json')
+        try:
+            with open(out_json, 'w') as f:
+                json.dump(all_predictions, f)
+            LOGGER.info(f'Saved predictions JSON to {out_json}')
+        except Exception as e:
+            LOGGER.info(f'Failed to write predictions JSON: {e}')
 
 @torch.no_grad()
 def detect2d(
@@ -214,7 +249,7 @@ def detect2d(
                     c = int(cls)  # integer class
                     label = names[c]
 
-                    bbox_list.append(Bbox(bbox, label))
+                    bbox_list.append(Bbox(bbox, label, score=float(conf), cls_id=c))
 
             # Print time (inference-only)
             LOGGER.info(f'{s}Done. ({t3 - t2:.3f}s)')
@@ -261,6 +296,8 @@ def parse_opt():
     parser.add_argument('--show_result', action='store_true', help='Show Results with imshow')
     parser.add_argument('--save_result', action='store_true', help='Save result')
     parser.add_argument('--output_path', type=str, default=ROOT / 'output', help='Save output pat')
+    parser.add_argument('--save_json', action='store_true', help='Save predictions to JSON for evaluation')
+    parser.add_argument('--json_path', type=str, default=ROOT / 'predictions.json', help='Path to save predictions JSON')
 
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
@@ -275,7 +312,9 @@ def main(opt):
         calib_file=opt.calib_file,
         show_result=opt.show_result,
         save_result=opt.save_result,
-        output_path=opt.output_path
+        output_path=opt.output_path,
+        save_json=opt.save_json,
+        json_path=str(opt.json_path)
     )
 
 if __name__ == "__main__":
