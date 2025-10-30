@@ -1,9 +1,7 @@
 import argparse
 import json
-import os
 from collections import defaultdict
 from pathlib import Path
-
 import numpy as np
 
 
@@ -28,7 +26,7 @@ def iou_xyxy(a, b):
     ih = max(0, iy2 - iy1 + 1)
     inter = iw * ih
     area_a = max(0, ax2 - ax1 + 1) * max(0, ay2 - ay1 + 1)
-    area_b = max(0, bx2 - bx1 + 1) * max(0, by2 - by1 + 1)
+    area_b = max(0, bx2 - bx1 + 1) * max(0, ay2 - ay1 + 1)
     union = area_a + area_b - inter
     return inter / union if union > 0 else 0.0
 
@@ -36,12 +34,17 @@ def iou_xyxy(a, b):
 def load_predictions(pred_json):
     with open(pred_json, 'r') as f:
         preds = json.load(f)
-    # Structure per image per class
+
+    # 🟢 Normalize class names to match KITTI GT labels (e.g., Car, Pedestrian, Cyclist)
+    for pred in preds:
+        if "class_name" in pred and isinstance(pred["class_name"], str):
+            pred["class_name"] = pred["class_name"].capitalize()
+
     per_image = defaultdict(list)
     class_names = set()
     for p in preds:
-        image = p['image']
-        bbox = p['bbox']  # [x1,y1,x2,y2]
+        image = Path(p['image']).name  # normalize filename only
+        bbox = p['bbox']  # [x1, y1, x2, y2]
         score = float(p['score']) if p.get('score') is not None else 1.0
         cls_name = p.get('class_name') or str(p.get('class_id', 'unknown'))
         per_image[image].append({'bbox': bbox, 'score': score, 'cls': cls_name})
@@ -79,7 +82,6 @@ def load_ground_truth(gt_dir):
 
 
 def compute_ap(recall, precision):
-    # VOC 2010+ interpolation method
     mrec = np.concatenate(([0.0], recall, [1.0]))
     mpre = np.concatenate(([0.0], precision, [0.0]))
     for i in range(mpre.size - 1, 0, -1):
@@ -90,9 +92,8 @@ def compute_ap(recall, precision):
 
 
 def evaluate_2d(pred_per_image, gt_by_image, classes, iou_thresh, img_ext):
-    # Prepare GT counts per class
     npos = {c: 0 for c in classes}
-    for image_stem, gts in gt_by_image.items():
+    for gts in gt_by_image.values():
         for g in gts:
             if g['cls'] in classes:
                 npos[g['cls']] += 1
@@ -102,27 +103,23 @@ def evaluate_2d(pred_per_image, gt_by_image, classes, iou_thresh, img_ext):
     rec_per_class = {}
 
     for cls in classes:
-        # Collect all predictions of this class across images
-        records = []  # (image_stem, score, bbox)
+        records = []
         for image_name, plist in pred_per_image.items():
-            stem = Path(image_name).stem  # image basename without ext
+            stem = Path(image_name).stem
             for p in plist:
                 if p['cls'] == cls:
                     records.append((stem, p['score'], p['bbox']))
 
-        if len(records) == 0:
+        if not records:
             ap_per_class[cls] = 0.0
             prec_per_class[cls] = np.array([0.0])
             rec_per_class[cls] = np.array([0.0])
             continue
 
-        # Sort by confidence desc
         records.sort(key=lambda x: x[1], reverse=True)
-
         tp = np.zeros(len(records))
         fp = np.zeros(len(records))
 
-        # Reset GT used flags for this class
         for gts in gt_by_image.values():
             for g in gts:
                 if g['cls'] == cls:
@@ -131,7 +128,7 @@ def evaluate_2d(pred_per_image, gt_by_image, classes, iou_thresh, img_ext):
         for i, (stem, score, pb) in enumerate(records):
             gts = [g for g in gt_by_image.get(stem, []) if g['cls'] == cls]
             ious = [iou_xyxy(pb, g['bbox']) for g in gts]
-            if len(ious) == 0:
+            if not ious:
                 fp[i] = 1
                 continue
             jmax = int(np.argmax(ious))
@@ -142,11 +139,9 @@ def evaluate_2d(pred_per_image, gt_by_image, classes, iou_thresh, img_ext):
             else:
                 fp[i] = 1
 
-        # Precision/Recall
         fp_cum = np.cumsum(fp)
         tp_cum = np.cumsum(tp)
-        denom = tp_cum + fp_cum
-        precision = tp_cum / np.maximum(denom, 1e-12)
+        precision = tp_cum / np.maximum(tp_cum + fp_cum, 1e-12)
         recall = tp_cum / max(npos[cls], 1e-12)
         ap = compute_ap(recall, precision)
 
@@ -154,7 +149,7 @@ def evaluate_2d(pred_per_image, gt_by_image, classes, iou_thresh, img_ext):
         prec_per_class[cls] = precision
         rec_per_class[cls] = recall
 
-    mAP = float(np.mean(list(ap_per_class.values()))) if len(ap_per_class) else 0.0
+    mAP = float(np.mean(list(ap_per_class.values()))) if ap_per_class else 0.0
     return ap_per_class, mAP, prec_per_class, rec_per_class, npos
 
 
@@ -164,10 +159,8 @@ def main():
     pred_per_image, pred_classes = load_predictions(args.pred_json)
     gt_by_image = load_ground_truth(args.gt_dir)
 
-    # Decide classes to evaluate
-    classes = args.classes if args.classes is not None else pred_classes
+    classes = args.classes if args.classes else pred_classes
 
-    # Print GT and prediction stats by class
     print('\n--- Data Stats ---')
     counts_pred = {cls: 0 for cls in classes}
     for plist in pred_per_image.values():
@@ -191,19 +184,16 @@ def main():
         img_ext=args.img_ext
     )
 
-    # Print summary
     print('Evaluation (IoU >= {:.2f})'.format(args.iou_thresh))
     for cls in classes:
         ap = ap_per_class.get(cls, 0.0)
         total = npos.get(cls, 0)
         last_p = float(prec_per_class[cls][-1]) if len(prec_per_class[cls]) else 0.0
         last_r = float(rec_per_class[cls][-1]) if len(rec_per_class[cls]) else 0.0
-        f1 = 2*last_p*last_r/(last_p+last_r) if (last_p+last_r)>0 else 0.0
-        print(f'- {cls}: AP={ap:.4f}, recall={last_r:.4f}, precision={last_p:.4f}, F1={f1:.4f}, GT={total}')
+        f1 = 2 * last_p * last_r / (last_p + last_r) if (last_p + last_r) > 0 else 0.0
+        print(f'- {cls}: AP={ap:.4f}, Recall={last_r:.4f}, Precision={last_p:.4f}, F1={f1:.4f}, GT={total}')
     print(f'mAP: {mAP:.4f}')
 
 
 if __name__ == '__main__':
     main()
-
-

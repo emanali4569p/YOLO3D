@@ -2,7 +2,6 @@ import argparse
 import json
 from collections import defaultdict
 from pathlib import Path
-
 import numpy as np
 
 
@@ -16,6 +15,7 @@ def parse_args():
     return parser.parse_args()
 
 
+# ======== Load Predictions ========
 def load_predictions(pred_json):
     with open(pred_json, 'r') as f:
         preds = json.load(f)
@@ -23,14 +23,15 @@ def load_predictions(pred_json):
     class_names = set()
     for p in preds:
         image = Path(p['image']).stem
-        cls_name = p.get('class_name') or str(p.get('class_id', 'unknown'))
-        score = float(p['score']) if p.get('score') is not None else 1.0
-        dims = p.get('dimensions')  # [h,w,l]
-        loc = p.get('location')     # [x,y,z]
+        cls_name = str(p.get('class_name', '')).strip().capitalize()  # normalize to match KITTI labels
+        score = float(p.get('score', 1.0))
+        dims = p.get('dimensions')
+        loc = p.get('location')
         ry = p.get('rotation_y')
+
         if dims is None or loc is None or ry is None:
-            # skip if 3D fields missing
             continue
+
         per_image[image].append({
             'cls': cls_name,
             'score': score,
@@ -42,9 +43,12 @@ def load_predictions(pred_json):
     return per_image, sorted(class_names)
 
 
+# ======== Load Ground Truth ========
 def parse_kitti_label_line(line):
     parts = line.strip().split(' ')
-    cls = parts[0]
+    if len(parts) < 15:
+        return None
+    cls = parts[0].strip()
     if cls == 'DontCare':
         return None
     h = float(parts[8]); w = float(parts[9]); l = float(parts[10])
@@ -56,6 +60,7 @@ def parse_kitti_label_line(line):
 def load_ground_truth(gt_dir):
     gt_dir = Path(gt_dir)
     gt_by_image = {}
+    all_classes = set()
     for txt in sorted(gt_dir.glob('*.txt')):
         stem = txt.stem
         entries = []
@@ -66,55 +71,43 @@ def load_ground_truth(gt_dir):
                     continue
                 cls, hwl, loc, ry = parsed
                 entries.append({'cls': cls, 'hwl': hwl, 'loc': loc, 'ry': ry, 'used': False})
+                all_classes.add(cls)
         gt_by_image[stem] = entries
-    return gt_by_image
+    return gt_by_image, sorted(all_classes)
 
 
+# ======== Geometry ========
 def bev_corners(loc, hwl, ry):
-    # loc: [x,y,z] in camera coords, hwl: [h,w,l], yaw ry around Y
-    w = hwl[1]; l = hwl[2]
-    # rectangle centered at (x,z)
-    x = loc[0]; z = loc[2]
-    dx = l / 2.0; dz = w / 2.0  # note: KITTI defines w across z, l across x; here we map l along x, w along z
-    # local corners before rotation
-    corners = np.array([
-        [ dx,  z + dz],
-        [ dx,  z - dz],
-        [-dx,  z - dz],
-        [-dx,  z + dz]
-    ], dtype=np.float32)
-    # rotate around (x,z)
-    c = np.cos(ry); s = np.sin(ry)
-    rot = np.array([[ c, -s],[ s,  c]], dtype=np.float32)
-    rel = corners - np.array([x, z], dtype=np.float32)
-    rot_rel = rel @ rot.T
-    out = rot_rel + np.array([x, z], dtype=np.float32)
-    return out  # shape (4,2) in (x,z)
+    w, l = hwl[1], hwl[2]
+    x, z = loc[0], loc[2]
+    dx, dz = l / 2.0, w / 2.0
+    corners = np.array([[dx, dz], [dx, -dz], [-dx, -dz], [-dx, dz]], dtype=np.float32)
+    c, s = np.cos(ry), np.sin(ry)
+    rot = np.array([[c, -s], [s, c]], dtype=np.float32)
+    rotated = corners @ rot.T + np.array([x, z])
+    return rotated
 
 
 def polygon_area(poly):
-    # poly: Nx2
     x = poly[:, 0]; y = poly[:, 1]
     return 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
 
 
 def intersect_polygons(subject, clip):
-    # Sutherland–Hodgman polygon clipping (convex clip assumed)
     def inside(p, a, b):
         return (b[0]-a[0])*(p[1]-a[1]) - (b[1]-a[1])*(p[0]-a[0]) >= 0
     def intersection(a1, a2, b1, b2):
         s10 = a2 - a1; s32 = b2 - b1
         denom = s10[0]*s32[1] - s32[0]*s10[1]
         if abs(denom) < 1e-9:
-            return a2  # parallel; fallback
+            return a2
         t = ((b1[0]-a1[0])*s32[1] - (b1[1]-a1[1])*s32[0]) / denom
         return a1 + t * s10
     output = subject.copy()
     for i in range(len(clip)):
         input_list = output
         output = []
-        A = clip[i]
-        B = clip[(i+1) % len(clip)]
+        A, B = clip[i], clip[(i + 1) % len(clip)]
         if len(input_list) == 0:
             break
         S = input_list[-1]
@@ -131,7 +124,6 @@ def intersect_polygons(subject, clip):
 
 
 def iou_bev(pred, gt):
-    # pred/gt: dict with 'loc','hwl','ry'
     pc = bev_corners(pred['loc'], pred['hwl'], pred['ry'])
     gc = bev_corners(gt['loc'], gt['hwl'], gt['ry'])
     inter_poly = intersect_polygons(pc, gc)
@@ -145,41 +137,31 @@ def iou_bev(pred, gt):
 
 
 def iou_3d(pred, gt):
-    # 3D IoU as BEV_intersection * height_overlap / union_volume
-    bev_iou_area = None
     pc = bev_corners(pred['loc'], pred['hwl'], pred['ry'])
     gc = bev_corners(gt['loc'], gt['hwl'], gt['ry'])
     inter_poly = intersect_polygons(pc, gc)
     if inter_poly is None or len(inter_poly) == 0:
-        bev_iou_area = 0.0
-    else:
-        bev_iou_area = polygon_area(inter_poly)
-    if bev_iou_area <= 0:
         return 0.0
-    area_p = polygon_area(pc)
-    area_g = polygon_area(gc)
-
-    # height overlap along Y
-    hp = pred['hwl'][0]; hg = gt['hwl'][0]
-    yp = pred['loc'][1] - hp/2.0; yp_top = pred['loc'][1] + hp/2.0
-    yg = gt['loc'][1] - hg/2.0; yg_top = gt['loc'][1] + hg/2.0
-    inter_h = max(0.0, min(yp_top, yg_top) - max(yp, yg))
-
-    inter_vol = bev_iou_area * inter_h
-    vol_p = area_p * hp
-    vol_g = area_g * hg
-    union_vol = vol_p + vol_g - inter_vol
-    return float(inter_vol / union_vol) if union_vol > 0 else 0.0
+    inter_area = polygon_area(inter_poly)
+    hp, hg = pred['hwl'][0], gt['hwl'][0]
+    yp_bot, yp_top = pred['loc'][1] - hp / 2, pred['loc'][1] + hp / 2
+    yg_bot, yg_top = gt['loc'][1] - hg / 2, gt['loc'][1] + hg / 2
+    inter_h = max(0.0, min(yp_top, yg_top) - max(yp_bot, yg_bot))
+    inter_vol = inter_area * inter_h
+    vol_p = polygon_area(pc) * hp
+    vol_g = polygon_area(gc) * hg
+    union = vol_p + vol_g - inter_vol
+    return float(inter_vol / union) if union > 0 else 0.0
 
 
+# ======== Evaluation ========
 def compute_ap(recall, precision):
     mrec = np.concatenate(([0.0], recall, [1.0]))
     mpre = np.concatenate(([0.0], precision, [0.0]))
     for i in range(mpre.size - 1, 0, -1):
         mpre[i - 1] = np.maximum(mpre[i - 1], mpre[i])
     idx = np.where(mrec[1:] != mrec[:-1])[0]
-    ap = np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
-    return ap
+    return np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])
 
 
 def evaluate(pred_per_image, gt_by_image, classes, iou_thresh, metric):
@@ -189,29 +171,25 @@ def evaluate(pred_per_image, gt_by_image, classes, iou_thresh, metric):
             if g['cls'] in classes:
                 npos[g['cls']] += 1
 
-    ap_per_class = {}
-    prec_per_class = {}
-    rec_per_class = {}
-
+    ap_per_class, prec_per_class, rec_per_class = {}, {}, {}
     iou_fn = iou_bev if metric == 'bev' else iou_3d
 
     for cls in classes:
-        records = []  # (stem, score, obj)
+        records = []
         for image, plist in pred_per_image.items():
             for p in plist:
                 if p['cls'] == cls:
                     records.append((image, p['score'], p))
-        if len(records) == 0:
+        if not records:
             ap_per_class[cls] = 0.0
             prec_per_class[cls] = np.array([0.0])
             rec_per_class[cls] = np.array([0.0])
             continue
-        records.sort(key=lambda x: x[1], reverse=True)
 
+        records.sort(key=lambda x: x[1], reverse=True)
         tp = np.zeros(len(records))
         fp = np.zeros(len(records))
 
-        # reset used flags for this class
         for gts in gt_by_image.values():
             for g in gts:
                 if g['cls'] == cls:
@@ -233,61 +211,45 @@ def evaluate(pred_per_image, gt_by_image, classes, iou_thresh, metric):
 
         fp_cum = np.cumsum(fp)
         tp_cum = np.cumsum(tp)
-        denom = tp_cum + fp_cum
-        precision = tp_cum / np.maximum(denom, 1e-12)
+        precision = tp_cum / np.maximum(tp_cum + fp_cum, 1e-12)
         recall = tp_cum / max(npos[cls], 1e-12)
         ap = compute_ap(recall, precision)
-
         ap_per_class[cls] = ap
         prec_per_class[cls] = precision
         rec_per_class[cls] = recall
 
-    mAP = float(np.mean(list(ap_per_class.values()))) if len(ap_per_class) else 0.0
+    mAP = float(np.mean(list(ap_per_class.values()))) if ap_per_class else 0.0
     return ap_per_class, mAP, prec_per_class, rec_per_class, npos
 
 
+# ======== Main ========
 def main():
     args = parse_args()
     pred_per_image, pred_classes = load_predictions(args.pred_json)
-    gt_by_image = load_ground_truth(args.gt_dir)
-    classes = args.classes if args.classes is not None else pred_classes
+    gt_by_image, gt_classes = load_ground_truth(args.gt_dir)
 
-    # Print GT and prediction stats by class
+    classes = args.classes if args.classes else gt_classes
+
     print('\n--- Data Stats ---')
-    counts_pred = {cls: 0 for cls in classes}
-    for plist in pred_per_image.values():
-        for p in plist:
-            if p['cls'] in classes:
-                counts_pred[p['cls']] += 1
-    counts_gt = {cls: 0 for cls in classes}
-    for gts in gt_by_image.values():
-        for g in gts:
-            if g['cls'] in classes:
-                counts_gt[g['cls']] += 1
     for cls in classes:
-        print(f"Class '{cls}': Preds={counts_pred[cls]}, GT={counts_gt[cls]}")
+        pred_count = sum(p['cls'] == cls for plist in pred_per_image.values() for p in plist)
+        gt_count = sum(g['cls'] == cls for gts in gt_by_image.values() for g in gts)
+        print(f"Class '{cls}': Preds={pred_count}, GT={gt_count}")
     print('---')
 
     ap_per_class, mAP, prec_per_class, rec_per_class, npos = evaluate(
-        pred_per_image=pred_per_image,
-        gt_by_image=gt_by_image,
-        classes=classes,
-        iou_thresh=args.iou_thresh,
-        metric=args.metric
+        pred_per_image, gt_by_image, classes, args.iou_thresh, args.metric
     )
 
-    print(f'3D Evaluation ({args.metric.upper()} IoU >= {args.iou_thresh:.2f})')
+    print(f'\n3D Evaluation ({args.metric.upper()} IoU >= {args.iou_thresh:.2f})')
     for cls in classes:
         ap = ap_per_class.get(cls, 0.0)
-        total = npos.get(cls, 0)
-        last_p = float(prec_per_class[cls][-1]) if len(prec_per_class[cls]) else 0.0
-        last_r = float(rec_per_class[cls][-1]) if len(rec_per_class[cls]) else 0.0
-        f1 = 2*last_p*last_r/(last_p+last_r) if (last_p+last_r)>0 else 0.0
-        print(f'- {cls}: AP={ap:.4f}, recall={last_r:.4f}, precision={last_p:.4f}, F1={f1:.4f}, GT={total}')
-    print(f'mAP: {mAP:.4f}')
+        r = rec_per_class[cls][-1] if len(rec_per_class[cls]) else 0
+        p = prec_per_class[cls][-1] if len(prec_per_class[cls]) else 0
+        f1 = 2*p*r/(p+r) if (p+r)>0 else 0
+        print(f"- {cls}: AP={ap:.4f}, Recall={r:.4f}, Precision={p:.4f}, F1={f1:.4f}, GT={npos[cls]}")
+    print(f"\nMean AP (mAP): {mAP:.4f}")
 
 
 if __name__ == '__main__':
     main()
-
-
